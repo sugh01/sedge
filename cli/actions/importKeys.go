@@ -49,6 +49,7 @@ type ImportValidatorKeysOptions struct {
 	GenerationPath  string
 	ContainerTag    string
 	CustomConfig    ImportValidatorKeysCustomOptions
+	Distributed     bool
 }
 type ImportValidatorKeysCustomOptions struct {
 	NetworkConfigPath string
@@ -96,6 +97,63 @@ func (s *sedgeActions) ImportValidatorKeys(options ImportValidatorKeysOptions) e
 		return err
 	}
 	options.GenerationPath = absGenerationPath
+
+	if options.Distributed {
+		cwd, err := os.Getwd()
+		if err != nil {
+			fmt.Println("Error:", err)
+			return err
+		}
+		charonPath := filepath.Join(cwd, ".charon")
+		charonValidatorKeysPath := filepath.Join(charonPath, "validator_keys")
+		defaultKeystorePath := filepath.Join(cwd, "keystore")
+		log.Infof("Copying the keys to the default path %s", defaultKeystorePath)
+		if err := os.MkdirAll(defaultKeystorePath, os.ModePerm); err != nil {
+			return err
+		}
+
+		validatorKeysPath := filepath.Join(defaultKeystorePath, "validator_keys")
+		if err := os.MkdirAll(validatorKeysPath, os.ModePerm); err != nil {
+			return err
+		}
+
+		depositDataPath := filepath.Join(charonPath, "deposit-data.json")
+		depositDataPathDest := filepath.Join(defaultKeystorePath, "deposit-data.json")
+		if err := copy.Copy(depositDataPath, depositDataPathDest); err != nil {
+			return err
+		}
+
+		files, err := os.ReadDir(charonValidatorKeysPath)
+		if err != nil {
+			log.Fatal(err)
+		}
+		len := len(files)
+		for i := 0; i < len/2; i++ {
+			keystorePath := filepath.Join(charonValidatorKeysPath, fmt.Sprintf("keystore-%d.json", i))
+			validatorPath := filepath.Join(validatorKeysPath, fmt.Sprintf("keystore-%d.json", i))
+			if err := copy.Copy(keystorePath, validatorPath); err != nil {
+				return err
+			}
+
+			keystoreTxtPath := filepath.Join(charonValidatorKeysPath, fmt.Sprintf("keystore-%d.txt", i))
+			keystorePasswordPath := filepath.Join(defaultKeystorePath, fmt.Sprintf("keystore-%d.txt", i))
+			if err := copy.Copy(keystoreTxtPath, keystorePasswordPath); err != nil {
+				return err
+			}
+		}
+		// Copy import scripts
+		if options.ValidatorClient == "lodestar" {
+			importScriptsPath := filepath.Join(cwd, "/scripts/charon/import_lodestar_keys.sh")
+			importScriptsPathDest := filepath.Join(defaultKeystorePath, "import_lodestar_keys.sh")
+			if err := copy.Copy(importScriptsPath, importScriptsPathDest); err != nil {
+				return err
+			}
+			// modify permissions
+			if err := os.Chmod(importScriptsPathDest, 0755); err != nil {
+				return err
+			}
+		}
+	}
 
 	if !isDefaultKeysPath(options.GenerationPath, options.From) {
 		defaultKeystorePath := filepath.Join(options.GenerationPath, "keystore")
@@ -254,11 +312,20 @@ func setupLodestarValidatorImport(dockerClient client.APIClient, serviceManager 
 		cmd = append(cmd, "--preset", preset)
 	}
 	log.Debugf("Creating %s container", validatorImportCtName)
-	ct, err := dockerClient.ContainerCreate(context.Background(),
-		&container.Config{
+	containerConfig := &container.Config{
+		Image: validatorImage,
+		Cmd:   cmd,
+	}
+	if options.Distributed {
+		containerConfig = &container.Config{
 			Image: validatorImage,
-			Cmd:   cmd,
-		},
+			Entrypoint: []string{
+				"/keystore/import_lodestar_keys.sh",
+			},
+		}
+	}
+	ct, err := dockerClient.ContainerCreate(context.Background(),
+		containerConfig,
 		&container.HostConfig{
 			Mounts:      mounts,
 			VolumesFrom: []string{validatorCtName},
